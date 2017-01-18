@@ -23,6 +23,7 @@ import (
 	"reflect"
 )
 
+// Deprecated
 type IPController struct {
 	clusterName string
 	kubeClient  clientset.Interface

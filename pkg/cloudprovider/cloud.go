@@ -35,6 +35,9 @@ type ArchonInterface interface {
 
 	ListInstances(clusterName string, network *cluster.Network, selector map[string]string) (names []string, instances []*cluster.InstanceStatus, err error)
 	GetInstance(clusterName string, instance *cluster.Instance) (status *cluster.InstanceStatus, err error)
+
+	EnsureInstanceDependency(clusterName string, instance *cluster.Instance) (status *cluster.InstanceStatus, err error)
+	EnsureInstanceDependencyDeleted(clusterName string, instance *cluster.Instance) (err error)
 	EnsureInstance(clusterName string, instance *cluster.Instance) (status *cluster.InstanceStatus, err error)
 	EnsureInstanceDeleted(clusterName string, instance *cluster.Instance) error
 

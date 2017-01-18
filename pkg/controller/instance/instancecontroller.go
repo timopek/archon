@@ -78,7 +78,6 @@ type instanceCache struct {
 type InstanceController struct {
 	cloud              cloudprovider.Interface
 	kubeClient         clientset.Interface
-	ipController       *IPController
 	certificateControl CertificateControlInterface
 	clusterName        string
 	namespace          string
@@ -105,8 +104,6 @@ func New(cloud cloudprovider.Interface, kubeClient clientset.Interface, clusterN
 		metrics.RegisterMetricAndTrackRateLimiterUsage("instance_controller", kubeClient.Core().RESTClient().GetRateLimiter())
 	}
 
-	ipController := NewIPController(cloud, kubeClient, clusterName)
-
 	certControl, err := NewCertificateControl(caCertFile, caKeyFile)
 	if err != nil {
 		glog.Errorf("WARNING: Unable to start certificate controller: %s", err.Error())
@@ -115,7 +112,6 @@ func New(cloud cloudprovider.Interface, kubeClient clientset.Interface, clusterN
 	s := &InstanceController{
 		cloud:              cloud,
 		kubeClient:         kubeClient,
-		ipController:       ipController,
 		certificateControl: certControl,
 		clusterName:        clusterName,
 		namespace:          namespace,
@@ -282,26 +278,34 @@ func (s *InstanceController) init() error {
 	return nil
 }
 
-func (s *InstanceController) ensureDependency(key string, instance *cluster.Instance) (error, *cluster.InstanceDependency) {
+func (s *InstanceController) ensureNetwork(key string, instance *cluster.Instance) error {
 	// Check Network availability before creating instance
 	network, err := s.kubeClient.Archon().Networks(instance.Namespace).Get(instance.Spec.NetworkName)
 	if err != nil {
-		return fmt.Errorf("Failed to get network %s: %v", instance.Spec.NetworkName, err), nil
+		return fmt.Errorf("Failed to get network %s: %v", instance.Spec.NetworkName, err)
 	}
 
 	if network.Status.Phase != cluster.NetworkRunning {
-		return fmt.Errorf("Network is not ready %s: %v", instance.Spec.NetworkName, network.Status.Phase), nil
+		return fmt.Errorf("Network is not ready %s: %v", instance.Spec.NetworkName, network.Status.Phase)
 	}
 
-	err = s.archon.AddNetworkAnnotation(s.clusterName, instance, network)
-	if err != nil {
-		return fmt.Errorf("Failed to add network annotation %s: %v", instance.Spec.NetworkName, err), nil
-	}
+	instance.Dependency.Network = *network
+	return nil
+}
 
-	// Ensure IP prerequistes
-	err, _ = s.ipController.SyncIP(key, instance, false)
-	if err != nil {
-		return fmt.Errorf("Failed to sync ip %s: %v", key, err), nil
+func (s *InstanceController) ensureDependency(key string, instance *cluster.Instance) (error, *cluster.InstanceDependency) {
+	/*
+		err = s.archon.AddNetworkAnnotation(s.clusterName, instance, network)
+		if err != nil {
+			return fmt.Errorf("Failed to add network annotation %s: %v", instance.Spec.NetworkName, err), nil
+		}
+	*/
+
+	if instance.Dependency.Network.Spec.Zone == "" {
+		err := s.ensureNetwork(key, instance)
+		if err != nil {
+			return err, nil
+		}
 	}
 
 	secrets := make([]api.Secret, 0)
@@ -339,11 +343,11 @@ func (s *InstanceController) ensureDependency(key string, instance *cluster.Inst
 	}
 
 	deps := &cluster.InstanceDependency{
-		Network: *network,
+		Network: instance.Dependency.Network,
 		Secrets: secrets,
 		Users:   users,
 	}
-	return err, deps
+	return nil, deps
 }
 
 // Returns an error if processing the instance update failed, along with a time.Duration
@@ -393,6 +397,17 @@ func (s *InstanceController) createInstanceIfNeeded(key string, instance *cluste
 		return nil, notRetryable
 	}
 
+	err := s.ensureNetwork(key, instance)
+	if err != nil {
+		return fmt.Errorf("Failed to ensure network %s: %v", key, err), retryable
+	}
+
+	glog.V(2).Infof("Ensuring instance cloud %s dependency", key)
+	instance, err, retryable := s.ensureCloudDependency(instance)
+	if err != nil {
+		return fmt.Errorf("Failed to ensure instance cloud dependency %s: %v", key, err), retryable
+	}
+
 	err, deps := s.ensureDependency(key, instance)
 	if err != nil {
 		return fmt.Errorf("Failed to ensure all dependencies %s: %v", key, err), retryable
@@ -400,21 +415,66 @@ func (s *InstanceController) createInstanceIfNeeded(key string, instance *cluste
 
 	instance.Dependency = *deps
 
-	previousState := *cluster.InstanceStatusDeepCopy(&instance.Status)
-
 	glog.V(2).Infof("Ensuring instance %s", key)
+	err, retryable = s.ensureInstance(instance)
+	if err != nil {
+		return fmt.Errorf("Failed to create instance %s: %v", key, err), retryable
+	}
+
+	return nil, notRetryable
+}
+
+// Cloudprovider will do some preparation for the instance and may update it.
+// So we need to return an updated instance
+func (s *InstanceController) ensureCloudDependency(instance *cluster.Instance) (*cluster.Instance, error, bool) {
+	previousState := *cluster.InstanceStatusDeepCopy(&instance.Status)
+	previousAnnotations := make(map[string]string)
+	util.MapCopy(previousAnnotations, instance.Annotations)
+
+	s.eventRecorder.Event(instance, api.EventTypeNormal, "CreatingInstanceDependency", "Creating instance cloud dependency")
+	status, err := s.archon.EnsureInstanceDependency(s.clusterName, instance)
+
+	// Allow update even if there's an error in case there's some changes applied
+	// to the instance
+	if status != nil {
+		instance.Status = *status
+	}
+
+	if !cluster.InstanceStatusEqual(previousState, instance.Status) || !util.MapEqual(previousAnnotations, instance.Annotations) {
+		if instance, err = s.persistUpdate(instance); err != nil {
+			return nil, fmt.Errorf("Failed to persist updated status to apiserver, even after retries. Giving up: %v", err), notRetryable
+		}
+	} else {
+		glog.V(2).Infof("Not persisting unchanged InstanceStatus to registry.")
+	}
+
+	if err == nil {
+		s.eventRecorder.Event(instance, api.EventTypeNormal, "CreatedInstanceDependency", "Created instance cloud dependency")
+	} else {
+		return nil, err, retryable
+	}
+
+	return instance, nil, notRetryable
+}
+
+func (s *InstanceController) ensureInstance(instance *cluster.Instance) (error, bool) {
+	previousState := *cluster.InstanceStatusDeepCopy(&instance.Status)
+	previousAnnotations := make(map[string]string)
+	util.MapCopy(previousAnnotations, instance.Annotations)
 
 	// The instance doesn't exist yet, so create it.
 	s.eventRecorder.Event(instance, api.EventTypeNormal, "CreatingInstance", "Creating instance")
-	err = s.createInstance(instance)
+	status, err := s.archon.EnsureInstance(s.clusterName, instance)
 	if err != nil {
-		return fmt.Errorf("Failed to create instance %s: %v", key, err), retryable
+		return err, retryable
+	} else if status != nil {
+		instance.Status = *status
 	}
 	s.eventRecorder.Event(instance, api.EventTypeNormal, "CreatedInstance", "Created instance")
 
 	// Write the status if changed.
-	if !cluster.InstanceStatusEqual(previousState, instance.Status) {
-		if err := s.persistUpdate(instance); err != nil {
+	if !cluster.InstanceStatusEqual(previousState, instance.Status) || !util.MapEqual(previousAnnotations, instance.Annotations) {
+		if instance, err = s.persistUpdate(instance); err != nil {
 			return fmt.Errorf("Failed to persist updated status to apiserver, even after retries. Giving up: %v", err), notRetryable
 		}
 	} else {
@@ -424,12 +484,11 @@ func (s *InstanceController) createInstanceIfNeeded(key string, instance *cluste
 	return nil, notRetryable
 }
 
-func (s *InstanceController) persistUpdate(instance *cluster.Instance) error {
-	var err error
+func (s *InstanceController) persistUpdate(instance *cluster.Instance) (updatedInstance *cluster.Instance, err error) {
 	for i := 0; i < clientRetryCount; i++ {
-		_, err = s.kubeClient.Archon().Instances(instance.Namespace).UpdateStatus(instance)
+		updatedInstance, err = s.kubeClient.Archon().Instances(instance.Namespace).UpdateStatus(instance)
 		if err == nil {
-			return nil
+			return
 		}
 		// If the object no longer exists, we don't want to recreate it. Just bail
 		// out so that we can process the delete, which we should soon be receiving
@@ -437,30 +496,19 @@ func (s *InstanceController) persistUpdate(instance *cluster.Instance) error {
 		if errors.IsNotFound(err) {
 			glog.Infof("Not persisting update to instance '%s/%s' that no longer exists: %v",
 				instance.Namespace, instance.Name, err)
-			return nil
+			return instance, nil
 		}
 		// TODO: Try to resolve the conflict if the change was unrelated to instance
 		if errors.IsConflict(err) {
 			glog.V(4).Infof("Not persisting update to instance '%s/%s' that has been changed since we received it: %v",
 				instance.Namespace, instance.Name, err)
-			return nil
+			return instance, nil
 		}
 		glog.Warningf("Failed to persist updated InstanceStatus to instance '%s/%s' after creating: %v",
 			instance.Namespace, instance.Name, err)
 		time.Sleep(clientRetryInterval)
 	}
-	return err
-}
-
-func (s *InstanceController) createInstance(instance *cluster.Instance) error {
-	status, err := s.archon.EnsureInstance(s.clusterName, instance)
-	if err != nil {
-		return err
-	} else if status != nil {
-		instance.Status = *status
-	}
-
-	return nil
+	return instance, err
 }
 
 func (s *instanceCache) ListKeys() []string {
@@ -623,25 +671,15 @@ func (s *InstanceController) processInstanceDeletion(key string) (error, time.Du
 	}
 	s.eventRecorder.Event(instance, api.EventTypeNormal, "DeletedInstance", "Deleted instance")
 
-	// IP
-	s.eventRecorder.Event(instance, api.EventTypeNormal, "SyncIP", "Releasing ip if needed")
-	err, retry := s.ipController.SyncIP(s.clusterName, instance, true)
+	// Instance dependency
+	s.eventRecorder.Event(instance, api.EventTypeNormal, "DeleteInstanceDependency", "Deleting instance dependency")
+	err = s.archon.EnsureInstanceDependencyDeleted(s.clusterName, instance)
 	if err != nil {
-		message := "Error syncing ip of instance"
-		if retry {
-			message += " (will retry): "
-		} else {
-			message += " (will not retry): "
-		}
-		message += err.Error()
-		s.eventRecorder.Event(instance, api.EventTypeWarning, "SyncIPFailed", message)
-		if retry {
-			return err, cachedInstance.nextRetryDelay()
-		} else {
-			return err, doNotRetry
-		}
+		message := "Error deleting instance dependency" + err.Error()
+		s.eventRecorder.Event(instance, api.EventTypeWarning, "DeletingInstanceDependencyFailed", message)
+		return err, cachedInstance.nextRetryDelay()
 	}
-	s.eventRecorder.Event(instance, api.EventTypeNormal, "SyncIP", "Sync ip done")
+	s.eventRecorder.Event(instance, api.EventTypeNormal, "DeleteInstanceDependency", "Deleted instance dependency")
 
 	s.cache.delete(key)
 

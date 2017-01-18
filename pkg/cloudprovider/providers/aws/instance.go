@@ -133,9 +133,36 @@ func (p *awsCloud) getInstance(awsnetwork AWSNetwork, instanceID string) (status
 	return instanceToStatus(instances[0]), nil
 }
 
+// Create network interfaces and eip if required by the user
+func (p *awsCloud) EnsureInstanceDependency(clusterName string, instance *cluster.Instance) (status *cluster.InstanceStatus, err error) {
+	options := cluster.InstanceOptions{}
+	if instance.Labels != nil {
+		err = util.MapToStruct(instance.Labels, &options, cluster.AnnotationPrefix)
+		if err != nil {
+			return
+		}
+	}
+
+	if options.PreallocatePublicIP {
+		status, err = p.EnsurePublicIP(clusterName, instance)
+		if err != nil {
+			return
+		}
+	}
+
+	if options.PreallocatePrivateIP {
+		status, err = p.EnsurePrivateIP(clusterName, instance)
+		if err != nil {
+			return
+		}
+	}
+
+	return
+}
+
 func (p *awsCloud) EnsureInstance(clusterName string, instance *cluster.Instance) (status *cluster.InstanceStatus, err error) {
 	awsnetwork := AWSNetwork{}
-	err = util.MapToStruct(instance.Annotations, &awsnetwork, AWSAnnotationPrefix)
+	err = util.MapToStruct(instance.Dependency.Network.Annotations, &awsnetwork, AWSAnnotationPrefix)
 	if err != nil {
 		err = fmt.Errorf("Network is not ready. Can't create instance: %s", err.Error())
 		return
@@ -193,7 +220,7 @@ func (p *awsCloud) createInstance(clusterName string, instance *cluster.Instance
 	}
 
 	awsnetwork := AWSNetwork{}
-	err = util.MapToStruct(instance.Annotations, &awsnetwork, AWSAnnotationPrefix)
+	err = util.MapToStruct(instance.Dependency.Network.Annotations, &awsnetwork, AWSAnnotationPrefix)
 	if err != nil || awsnetwork.Subnet == "" || awsnetwork.VPC == "" {
 		err = fmt.Errorf("Can't get network from instance annotations: %+v", err)
 		return
@@ -375,6 +402,15 @@ func (p *awsCloud) createInstance(clusterName string, instance *cluster.Instance
 	glog.Infof("New instance created %+v", status)
 	nifIDs = []string{}
 	return
+}
+
+func (p *awsCloud) EnsureInstanceDependencyDeleted(clusterName string, instance *cluster.Instance) (err error) {
+	err = p.EnsurePublicIPDeleted(clusterName, instance)
+	if err != nil {
+		return
+	}
+
+	return p.EnsurePrivateIPDeleted(clusterName, instance)
 }
 
 func (p *awsCloud) EnsureInstanceDeleted(clusterName string, instance *cluster.Instance) (err error) {

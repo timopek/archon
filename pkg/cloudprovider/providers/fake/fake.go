@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors.
+Copyright 2016 The Archon Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -32,7 +32,6 @@ type FakeInstance struct {
 	userdata []byte
 }
 
-// FakeCloud is a test-double implementation of Interface, LoadBalancer, Instances, and Routes. It is useful for testing.
 type FakeCloud struct {
 	fake.FakeCloud
 	FakeInstances map[string]FakeInstance
@@ -70,7 +69,6 @@ func (f *FakeCloud) EnsureNetworkDeleted(clusterName string, network *cluster.Ne
 	return nil
 }
 
-// GetLoadBalancer is a stub implementation of LoadBalancer.GetLoadBalancer.
 func (f *FakeCloud) GetInstance(clusterName string, instance *cluster.Instance) (*cluster.InstanceStatus, error) {
 	status := &cluster.InstanceStatus{}
 	status.Phase = cluster.InstanceRunning
@@ -78,8 +76,11 @@ func (f *FakeCloud) GetInstance(clusterName string, instance *cluster.Instance) 
 	return status, f.Err
 }
 
-// EnsureLoadBalancer is a test-spy implementation of LoadBalancer.EnsureLoadBalancer.
-// It adds an entry "create" into the internal method call record.
+func (f *FakeCloud) EnsureInstanceDependency(clusterName string, instance *cluster.Instance) (*cluster.InstanceStatus, error) {
+	f.addCall("createDependency")
+	return &instance.Status, nil
+}
+
 func (f *FakeCloud) EnsureInstance(clusterName string, instance *cluster.Instance) (*cluster.InstanceStatus, error) {
 	f.addCall("create")
 	if f.FakeInstances == nil {
@@ -103,15 +104,16 @@ func (f *FakeCloud) EnsureInstance(clusterName string, instance *cluster.Instanc
 	return status, f.Err
 }
 
-// EnsureLoadBalancerDeleted is a test-spy implementation of LoadBalancer.EnsureLoadBalancerDeleted.
-// It adds an entry "delete" into the internal method call record.
 func (f *FakeCloud) EnsureInstanceDeleted(clusterName string, instance *cluster.Instance) error {
 	f.addCall("delete")
 	return f.Err
 }
 
-// List is a test-spy implementation of Instances.List.
-// It adds an entry "list" into the internal method call record.
+func (f *FakeCloud) EnsureInstanceDependencyDeleted(clusterName string, instance *cluster.Instance) (err error) {
+	f.addCall("deleteDependency")
+	return nil
+}
+
 func (f *FakeCloud) ListInstances(clusterName string, network *cluster.Network, selector map[string]string) ([]string, []*cluster.InstanceStatus, error) {
 	f.addCall("list")
 	result := make([]string, 0)

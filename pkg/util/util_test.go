@@ -73,6 +73,20 @@ func (t *M2SSuite) TestMStructToMap() {
 	t.Equal(n, m)
 }
 
+func (t *M2SSuite) TestMapEqual() {
+	m1 := map[string]string{
+		"a:": "1",
+	}
+	m2 := map[string]int{
+		"a": 1,
+	}
+	t.Equal(MapEqual(m1, m2), false)
+
+	m1 = make(map[string]string)
+	m3 := (map[string]string)(nil)
+	t.Equal(MapEqual(m1, m3), true)
+}
+
 func TestRunM2SSuite(t *testing.T) {
 	suite.Run(t, new(M2SSuite))
 }

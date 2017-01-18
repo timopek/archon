@@ -250,7 +250,7 @@ func (s *NetworkController) createNetworkIfNeeded(key string, network *cluster.N
 	s.eventRecorder.Event(network, api.EventTypeNormal, "CreatedNetwork", "Created network")
 
 	// Write the state if changed
-	if !reflect.DeepEqual(previousState, network.Status) || !reflect.DeepEqual(previousAnnotations, network.Annotations) {
+	if !reflect.DeepEqual(previousState, network.Status) || !util.MapEqual(previousAnnotations, network.Annotations) {
 		if err := s.persistUpdate(network); err != nil {
 			return fmt.Errorf("Failed to persist updated status to apiserver, even after retries. Giving up: %v", err), notRetryable
 		}

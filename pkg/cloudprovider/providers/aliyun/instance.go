@@ -43,6 +43,10 @@ var (
 	}
 )
 
+type AliyunInstanceInitialized struct {
+	Initialized bool `k8s:"instance-initialized"`
+}
+
 type AliyunInstanceOptions struct {
 	InternetMaxBandwidthIn  int    `k8s:"internet-max-bandwidth-in"`
 	InternetMaxBandwidthOut int    `k8s:"internet-max-bandwidth-out"`
@@ -120,11 +124,21 @@ func (p *aliyunCloud) getInstance(region string, instanceID string) (status *clu
 	return instanceToStatus(*instance), nil
 }
 
-func (p *aliyunCloud) EnsureInstance(clusterName string, instance *cluster.Instance) (status *cluster.InstanceStatus, err error) {
+// For aliyun we create an instance in stopped state to allocate all IPs. Check
+// the status of instance in the cloud, if it's failing, delete it and recreate
+// TODO: handle recreation here, or in IC or in IGC?
+func (p *aliyunCloud) EnsureInstanceDependency(clusterName string, instance *cluster.Instance) (status *cluster.InstanceStatus, err error) {
 	an := AliyunNetwork{}
-	err = util.MapToStruct(instance.Annotations, &an, AliyunAnnotationPrefix)
+	err = util.MapToStruct(instance.Dependency.Network.Annotations, &an, AliyunAnnotationPrefix)
 	if err != nil || an.VSwitch == "" {
 		err = fmt.Errorf("Network is not ready. Can't create instance: %v", err)
+		return
+	}
+
+	ai := AliyunInstanceInitialized{}
+	err = util.MapToStruct(instance.Annotations, &ai, AliyunAnnotationPrefix)
+	if err != nil && instance.Annotations != nil {
+		err = fmt.Errorf("Can't tell if the instance is initialized: %v", err)
 		return
 	}
 
@@ -141,6 +155,12 @@ func (p *aliyunCloud) EnsureInstance(clusterName string, instance *cluster.Insta
 
 		switch status2.Phase {
 		case cluster.InstanceFailed, cluster.InstanceUnknown:
+			if ai.Initialized == false {
+				// Proceed to intiailization
+				return &instance.Status, nil
+			}
+
+			glog.V(2).Infof("Instance has failed. Recreating...")
 			err = p.EnsureInstanceDeleted(clusterName, instance)
 			if err != nil {
 				return
@@ -156,6 +176,23 @@ func (p *aliyunCloud) EnsureInstance(clusterName string, instance *cluster.Insta
 	return
 }
 
+// If the instance is not marked initialized, initialize it
+func (p *aliyunCloud) EnsureInstance(clusterName string, instance *cluster.Instance) (status *cluster.InstanceStatus, err error) {
+	ai := AliyunInstanceInitialized{}
+	err = util.MapToStruct(instance.Annotations, &ai, AliyunAnnotationPrefix)
+	if err != nil && instance.Annotations != nil {
+		err = fmt.Errorf("Can't tell if the instance is initialized: %v", err)
+		return
+	}
+
+	if ai.Initialized == true {
+		return &instance.Status, nil
+	}
+
+	return p.initializeInstance(clusterName, instance)
+}
+
+// For aliyun we create an instance in stopped state to allocate all IPs.
 func (p *aliyunCloud) createInstance(clusterName string, instance *cluster.Instance) (status *cluster.InstanceStatus, err error) {
 	var vpsID string
 	defer func() {
@@ -179,7 +216,7 @@ func (p *aliyunCloud) createInstance(clusterName string, instance *cluster.Insta
 	networkSpec := instance.Dependency.Network.Spec
 
 	an := AliyunNetwork{}
-	err = util.MapToStruct(instance.Annotations, &an, AliyunAnnotationPrefix)
+	err = util.MapToStruct(instance.Dependency.Network.Annotations, &an, AliyunAnnotationPrefix)
 	if err != nil || an.VSwitch == "" || an.VPC == "" {
 		err = fmt.Errorf("Can't get network from instance annotations: %+v", err)
 		return
@@ -191,13 +228,12 @@ func (p *aliyunCloud) createInstance(clusterName string, instance *cluster.Insta
 		InternetMaxBandwidthIn:  200,
 	}
 	err = util.MapToStruct(instance.Annotations, &aio, AliyunAnnotationPrefix)
-	if err != nil {
+	if err != nil && instance.Annotations != nil {
 		err = fmt.Errorf("Unable to get aliyun instance options: %v", err)
 		return
 	}
 
-	// Ignore preallocate public/private ip options. Always create instance frist, generate userdata later, then start the instance
-
+	// Instance type
 	instanceType := instance.Spec.InstanceType
 	if instanceType == "" {
 		return nil, fmt.Errorf("Instance type must be specified")
@@ -233,6 +269,45 @@ func (p *aliyunCloud) createInstance(clusterName string, instance *cluster.Insta
 		}
 	}
 
+	vpsID, err = p.ecs.CreateInstance(args)
+	if err != nil {
+		err = aliyunSafeError(err)
+		return
+	}
+
+	// Wait until it's stopped
+	p.ecs.WaitForInstance(vpsID, ecs.Stopped, 0)
+
+	// Public IP
+	_, err = p.ecs.AllocatePublicIpAddress(vpsID)
+	if err != nil {
+		err = aliyunSafeError(err)
+		return
+	}
+
+	status, err = p.getInstance(networkSpec.Region, vpsID)
+	if err != nil {
+		err = aliyunSafeError(err)
+		return
+	}
+
+	return
+}
+
+// Here we modify the instance after the proper dependency is provided, start
+// the instance and do the initialization
+func (p *aliyunCloud) initializeInstance(clusterName string, instance *cluster.Instance) (status *cluster.InstanceStatus, err error) {
+	// User data
+	u, err := userdata.Generate(instance)
+	if err != nil {
+		return nil, err
+	}
+
+	vpsID := instance.Status.InstanceID
+	args := &ecs.ModifyInstanceAttributeArgs{
+		InstanceId: vpsID,
+	}
+
 	// Set password if provided in secret
 	for _, s := range instance.Dependency.Secrets {
 		if s.Type == api.SecretTypeBasicAuth {
@@ -256,41 +331,12 @@ func (p *aliyunCloud) createInstance(clusterName string, instance *cluster.Insta
 		args.Password = util.RandPassword(30)
 	}
 
-	vpsID, err = p.ecs.CreateInstance(args)
-	if err != nil {
-		err = aliyunSafeError(err)
-		return
-	}
-
-	// Wait until it's stopped
-	p.ecs.WaitForInstance(vpsID, ecs.Stopped, 0)
-
-	// Public IP
-	publicIP, err := p.ecs.AllocatePublicIpAddress(vpsID)
-	if err != nil {
-		err = aliyunSafeError(err)
-		return
-	}
-
-	status, err = p.getInstance(networkSpec.Region, vpsID)
-	if err != nil {
-		err = aliyunSafeError(err)
-		return
-	}
-
-	oldStatus := instance.Status
-	instance.Status = *status
-
-	// User data
-	u, err := userdata.Generate(instance)
+	err = p.ecs.ModifyInstanceAttribute(args)
 	if err != nil {
 		return nil, err
 	}
 
-	instance.Status = oldStatus
-
 	/*
-		// TODO: aliyun doesn't support modifying userdata when coreos is used as image
 		// Modify userdata, aliyun api will encode it
 			err = p.ecs.ModifyInstanceAttribute(&ecs.ModifyInstanceAttributeArgs{
 				InstanceId: vpsID,
@@ -317,7 +363,7 @@ func (p *aliyunCloud) createInstance(clusterName string, instance *cluster.Insta
 	// Try cloudinit
 	wait.PollImmediate(CloudInitInterval, CloudInitTimeout, func() (bool, error) {
 		err = cloudinit.Run(&cloudinit.Config{
-			Hostname: publicIP,
+			Hostname: instance.Status.PublicIP,
 			Port:     22,
 			User:     SSHUsername,
 			Password: args.Password,
@@ -326,7 +372,7 @@ func (p *aliyunCloud) createInstance(clusterName string, instance *cluster.Insta
 			UserData: string(u),
 		})
 		if err != nil {
-			glog.Infof("Cloudinit failed. Still waiting: %v", err)
+			glog.V(4).Infof("Cloudinit failed. Still waiting: %v", err)
 		}
 		return err == nil, nil
 	})
@@ -335,12 +381,23 @@ func (p *aliyunCloud) createInstance(clusterName string, instance *cluster.Insta
 		return nil, fmt.Errorf("Unable to ssh-cloudinit the instance: %v", err)
 	}
 
+	ai := AliyunInstanceInitialized{
+		Initialized: true,
+	}
+	if instance.Annotations == nil {
+		instance.Annotations = make(map[string]string)
+	}
+	err = util.StructToMap(ai, instance.Annotations, AliyunAnnotationPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to set initialized flag: %v", err)
+	}
+
 	// Return latest status
-	status, err = p.getInstance(networkSpec.Region, vpsID)
+	status, err = p.getInstance(instance.Dependency.Network.Spec.Region, vpsID)
 	if err != nil {
 		err = aliyunSafeError(err)
 	} else {
-		glog.Infof("New instance created %+v", status)
+		glog.Infof("Instance is initialized %+v", status)
 	}
 	return
 }
@@ -369,4 +426,8 @@ func (p *aliyunCloud) deleteInstance(vpsID string) (err error) {
 	}
 
 	return
+}
+
+func (p *aliyunCloud) EnsureInstanceDependencyDeleted(clusterName string, instance *cluster.Instance) (err error) {
+	return nil
 }

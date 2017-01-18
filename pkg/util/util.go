@@ -119,6 +119,7 @@ func StructToMap(in interface{}, out map[string]string, prefix string) (err erro
 	return nil
 }
 
+// Copy the values of maps of the same type
 func MapCopy(dst interface{}, src interface{}) (err error) {
 	defer func() {
 		if err2 := recover(); err2 != nil {
@@ -150,4 +151,30 @@ func MapCopy(dst interface{}, src interface{}) (err error) {
 	}
 
 	return
+}
+
+// Check if two maps have the same key and values, an empty map == nil
+func MapEqual(dst interface{}, src interface{}) (ret bool) {
+	defer func() {
+		if err2 := recover(); err2 != nil {
+			ret = false
+		}
+	}()
+
+	srct := reflect.TypeOf(src)
+	dstt := reflect.TypeOf(dst)
+	if srct.Kind() != reflect.Map ||
+		dstt.Kind() != reflect.Map ||
+		srct.Key().Kind() != dstt.Key().Kind() ||
+		srct.Elem().Kind() != dstt.Elem().Kind() {
+		return false
+	}
+
+	srcv := reflect.ValueOf(src)
+	dstv := reflect.ValueOf(dst)
+	if len(srcv.MapKeys()) == 0 && len(dstv.MapKeys()) == 0 {
+		return true
+	}
+
+	return reflect.DeepEqual(src, dst)
 }
