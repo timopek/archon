@@ -32,14 +32,17 @@ var (
 	ErrorNotFound     = fmt.Errorf("Instance is not found")
 	CloudInitInterval = 5 * time.Second
 	CloudInitTimeout  = 3 * time.Minute
+	// Aliyun doesn't allow tag keys starting with "aliyun"
+	InitializedTagKey = "instance." + AliyunAnnotationPrefix + "initialized"
 	SSHUsername       = "root"
 	SSHSystem         = "coreos"
 	StateMap          = map[ecs.InstanceStatus]cluster.InstancePhase{
-		ecs.Creating: cluster.InstancePending,
+		ecs.Pending:  cluster.InstancePending,
 		ecs.Starting: cluster.InstancePending,
 		ecs.Running:  cluster.InstanceRunning,
 		ecs.Stopping: cluster.InstanceFailed,
 		ecs.Stopped:  cluster.InstanceFailed,
+		ecs.Deleted:  cluster.InstanceFailed,
 	}
 )
 
@@ -60,6 +63,19 @@ func instanceToStatus(i ecs.InstanceAttributesType) *cluster.InstanceStatus {
 		glog.Warningf("Unknown instance state: %+v", i.Status)
 		phase = cluster.InstanceUnknown
 	}
+
+	// If the instance is not marked as initialized and its vps is in stopped state,
+	// return Pending
+	initialized := false
+	for _, tag := range i.Tags.Tag {
+		if tag.TagKey == InitializedTagKey {
+			initialized = true
+		}
+	}
+	if i.Status == ecs.Stopped && initialized == false {
+		phase = cluster.InstancePending
+	}
+
 	return &cluster.InstanceStatus{
 		Phase:             phase,
 		PrivateIP:         firstIP(i.VpcAttributes.PrivateIpAddress),
@@ -381,6 +397,7 @@ func (p *aliyunCloud) initializeInstance(clusterName string, instance *cluster.I
 		return nil, fmt.Errorf("Unable to ssh-cloudinit the instance: %v", err)
 	}
 
+	// Put initialized annotation
 	ai := AliyunInstanceInitialized{
 		Initialized: true,
 	}
@@ -392,8 +409,25 @@ func (p *aliyunCloud) initializeInstance(clusterName string, instance *cluster.I
 		return nil, fmt.Errorf("Unable to set initialized flag: %v", err)
 	}
 
+	// Put initialized tag
+	tags := map[string]string{
+		InitializedTagKey: "true",
+	}
+	network := instance.Dependency.Network
+	err = p.ecs.AddTags(&ecs.AddTagsArgs{
+		RegionId:     common.Region(network.Spec.Region),
+		ResourceId:   vpsID,
+		ResourceType: ecs.TagResourceInstance,
+		Tag:          tags,
+	})
+	if err != nil {
+		err = aliyunSafeError(err)
+		glog.Infof("Unable to tag instance as initialized!  %+v", err)
+		return
+	}
+
 	// Return latest status
-	status, err = p.getInstance(instance.Dependency.Network.Spec.Region, vpsID)
+	status, err = p.getInstance(network.Spec.Region, vpsID)
 	if err != nil {
 		err = aliyunSafeError(err)
 	} else {
