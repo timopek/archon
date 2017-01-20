@@ -313,13 +313,23 @@ func (p *aliyunCloud) createInstance(clusterName string, instance *cluster.Insta
 // Here we modify the instance after the proper dependency is provided, start
 // the instance and do the initialization
 func (p *aliyunCloud) initializeInstance(clusterName string, instance *cluster.Instance) (status *cluster.InstanceStatus, err error) {
+	vpsID := instance.Status.InstanceID
+
+	defer func() {
+		if err != nil {
+			err2 := p.ecs.StopInstance(vpsID, true)
+			if err2 != nil {
+				glog.Errorf("Unable to rollback failed initialization: %v", err2)
+			}
+		}
+	}()
+
 	// User data
 	u, err := userdata.Generate(instance)
 	if err != nil {
 		return nil, err
 	}
 
-	vpsID := instance.Status.InstanceID
 	args := &ecs.ModifyInstanceAttributeArgs{
 		InstanceId: vpsID,
 	}

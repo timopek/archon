@@ -392,8 +392,7 @@ func (s *InstanceController) processInstanceUpdate(cachedInstance *cachedInstanc
 // Returns whatever error occurred along with a boolean indicator of whether it
 // should be retried.
 func (s *InstanceController) createInstanceIfNeeded(key string, instance *cluster.Instance) (error, bool) {
-	// We will not recreate an instance
-	if instance.Status.InstanceID != "" || instance.Status.Phase == cluster.InstanceInitializing {
+	if instance.Status.Phase == cluster.InstanceInitializing {
 		return nil, notRetryable
 	}
 
@@ -403,9 +402,9 @@ func (s *InstanceController) createInstanceIfNeeded(key string, instance *cluste
 	}
 
 	glog.V(2).Infof("Ensuring instance cloud %s dependency", key)
-	instance, err, retryable := s.ensureCloudDependency(instance)
+	instance, err, retryable2 := s.ensureCloudDependency(instance)
 	if err != nil {
-		return fmt.Errorf("Failed to ensure instance cloud dependency %s: %v", key, err), retryable
+		return fmt.Errorf("Failed to ensure instance cloud dependency %s: %v", key, err), retryable2
 	}
 
 	err, deps := s.ensureDependency(key, instance)
@@ -416,9 +415,9 @@ func (s *InstanceController) createInstanceIfNeeded(key string, instance *cluste
 	instance.Dependency = *deps
 
 	glog.V(2).Infof("Ensuring instance %s", key)
-	err, retryable = s.ensureInstance(instance)
+	err, retryable2 = s.ensureInstance(instance)
 	if err != nil {
-		return fmt.Errorf("Failed to create instance %s: %v", key, err), retryable
+		return fmt.Errorf("Failed to create instance %s: %v", key, err), retryable2
 	}
 
 	return nil, notRetryable
